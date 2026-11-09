@@ -71,12 +71,12 @@ except OSError: pass
 
 # ── 1) claves (secretos del repo) → config.json local de esta máquina (nunca se imprime)
 c = _cfg.leer()
-for k in ("deepseek", "openai", "fish", "runpod", "groq"):
+for k in ("deepseek", "openai", "fish", "runpod", "groq", "pexels"):
     v = (E.get(k.upper() + "_API_KEY") or "").strip()
     if v: c[k] = v
 c["github"] = TOK                                  # token del propio workflow: sube cara+audio un rato a ESTE repo (público) para RunPod
 c["avatar_repo"] = REPO.split("/")[1]
-c["fotos_motor"] = "openai"
+c["fotos_motor"] = "ahorro" if str(E.get("AHORRO") or "") == "1" and c.get("pexels") else "openai"
 _cfg.guardar(c)
 os.chmod(_cfg.CONFIG, 0o600)
 # La sesión de DeepSeek corre con otro usuario y solo ve esta copia SIN claves; las herramientas usan el puente del motor.
@@ -84,7 +84,7 @@ _pub = E.get("ESTUDIO_CONFIG_PUB")
 if _pub:
     with open(_pub, "w", encoding="utf8") as _f: json.dump({k: ("via-puente" if v and k in _cfg.CLAVES + _cfg.OPCIONALES else v) for k, v in c.items()}, _f)
     os.chmod(_pub, 0o644)
-for _k in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "FISH_API_KEY", "RUNPOD_API_KEY", "GROQ_API_KEY"): E.pop(_k, None)
+for _k in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "FISH_API_KEY", "RUNPOD_API_KEY", "GROQ_API_KEY", "PEXELS_API_KEY"): E.pop(_k, None)
 
 # ── 2) el canal (lo sube el panel a canales/<id>/ del repo)
 cid = E["CANAL"]
@@ -106,7 +106,7 @@ rama_estado()
 
 import re                                          # noqa: E402
 TAPAR = re.compile(r"(api[ _-]?key[^\n]{0,20}?)\S*\*+\S*|sk-[A-Za-z0-9_\-]{8,}|gh[ps]_[A-Za-z0-9]{8,}|rpa_[A-Za-z0-9]{8,}|gsk_[A-Za-z0-9]{8,}", re.I)
-SECRETOS = [v for v in (str(c.get(k) or "") for k in ("deepseek", "openai", "fish", "runpod", "groq", "github")) if len(v) >= 8] + [TOK]
+SECRETOS = [v for v in (str(c.get(k) or "") for k in ("deepseek", "openai", "fish", "runpod", "groq", "pexels", "github")) if len(v) >= 8] + [TOK]
 def tapar(t):                                      # el repo es público: nada que se parezca a una clave
     for v in SECRETOS: t = t.replace(v, "[oculto]")
     return TAPAR.sub(lambda m: (m.group(1) or "") + "[oculto]", t)
@@ -151,7 +151,13 @@ def armar_panel(extra):
     vista = {k: x for k, x in v.items() if k != "cwd"}
     vista["nube"] = extra
     js("video.json", vista)
-    tl = server.timeline(rid); js("timeline.json", tl)
+    tl = server.timeline(rid)
+    for x in tl["lanes"]:                          # clips de stock: el panel los reproduce directo desde Pexels (los mp4 no se suben a GitHub)
+        if x.get("k") == "clip" and str(x.get("f") or "").endswith(".mp4"):
+            try: u = json.load(open(os.path.join(cwd, x["f"][:-4] + ".json"), encoding="utf8")).get("prev")
+            except (OSError, ValueError): u = None
+            if u: x["v"] = u
+    js("timeline.json", tl)
     g = server.gallery(rid); js("gallery.json", g)
     prompts = {}                                   # lo que se le pidió a cada foto, para el visor del panel
     for it in g["fotos"] + g["clips"]:
@@ -182,6 +188,24 @@ def armar_panel(extra):
         j = server.thumb(full, 1280, "/tmp/estudio_t")
         if not j: pub.pop("t:" + rel, None); continue
         dst = os.path.join(base, "t", rel + ".jpg"); os.makedirs(os.path.dirname(dst), exist_ok=True); shutil.copy2(j, dst)
+
+    X = os.path.join(cwd, "extrema")               # Edición extrema en vivo: cada pieza entra a la línea de tiempo, en versión liviana, apenas se renderiza
+    M = server.jload(os.path.join(X, "momentos.json"), []) or []
+    if M:
+        R = server.jload(os.path.join(X, "render.json"), {}) or {}
+        tl["xm"] = []
+        for m in M:
+            i = str(m.get("id") or ""); rel = "extrema/" + i + ".mp4"; full = os.path.join(cwd, rel); dst = os.path.join(base, "f", rel)
+            hecha = bool((R.get(i) or {}).get("ok")) and os.path.exists(full)
+            if hecha and nuevo("x:" + rel, full):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                try: mal = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", full, "-an", "-vf", "scale=640:-2", "-c:v", "libx264", "-preset", "veryfast", "-crf", "30", "-pix_fmt", "yuv420p", "-movflags", "+faststart", dst], capture_output=True, timeout=120).returncode
+                except subprocess.TimeoutExpired: mal = 1
+                if mal:
+                    pub.pop("x:" + rel, None)
+                    if os.path.exists(dst): os.remove(dst)
+            tl["xm"].append({"t0": m["startMs"] / 1000, "t1": m["endMs"] / 1000, "t": str(m.get("texto") or "")[:120], "f": rel if hecha and os.path.exists(dst) else ""})
+        js("timeline.json", tl)
 
     F = v.get("files") or {}
     for rel in [F.get(k) for k in ("guion", "reporte", "captions")] + ["planos.json"]:     # textos que abre el panel
@@ -219,7 +243,7 @@ def publicar_panel(extra):
         preparar_git()
         for intento in range(4):
             if not traer(): log("git: no pude traer la rama estado"); return
-            if intento: st["pub"] = {k: x for k, x in st.get("pub", {}).items() if k[:2] not in ("t:", "f:", "m:")}
+            if intento: st["pub"] = {k: x for k, x in st.get("pub", {}).items() if k[:2] not in ("t:", "f:", "m:", "x:")}
             armar_panel(extra)
             git("add", "-A", "panel/" + VID)
             if git("diff", "--cached", "--quiet").returncode == 0: return
@@ -250,11 +274,11 @@ def publicar(estado, extra=None):
                 ev.append({"k": x.get("k"), "t": tapar(t or "")[:400]})
         o = {"vid": VID, "titulo": E.get("TITULO"), "canal": cid, "estado": estado, "actualizado": time.time(),
              "creado": st.get("creado"), "run": RUN_URL, "pasos": (v.get("pipeline") or {}).get("steps"),
-             "costo": v.get("cost"), "eventos": ev, "maquinas": st.get("maquinas", 1), "extrema": "1" if str(E.get("EXTREMA") or "") == "1" else ""}
+             "costo": v.get("cost"), "eventos": ev, "maquinas": st.get("maquinas", 1), "extrema": "1" if str(E.get("EXTREMA") or "") == "1" else "", "ahorro": "1" if str(E.get("AHORRO") or "") == "1" else ""}
         o.update(st.get("final") or {})
         o.update(extra or {})
         escribir_estado(f"videos/{VID}.json", o)
-        publicar_panel({k: o.get(k) for k in ("titulo", "canal", "run", "estado", "error", "final", "release", "actualizado", "maquinas", "extrema")})
+        publicar_panel({k: o.get(k) for k in ("titulo", "canal", "run", "estado", "error", "final", "release", "actualizado", "maquinas", "extrema", "ahorro")})
     except Exception as e: log("no pude publicar el estado:", type(e).__name__)
 
 
@@ -288,12 +312,59 @@ else:
 server.jsave(ST, st)
 publicar("trabajando")
 
+XM_ON = str(E.get("EXTREMA") or "").lower() in ("1", "true", "si", "sí")
+XM_TOPE = str(min(float(E.get("TOPE_EXTREMA") or 0.20), 0.20))
+XM_LOG = os.path.join("/tmp", "extrema_" + VID + ".log")
+xm = {"p": None, "t": 0}
+
+
+def xm_lista(cwd):
+    """La edición extrema puede arrancar cuando hay voz con tiempos, tramos de avatar, plan y TODAS las fotos de los planos."""
+    if not all(os.path.exists(os.path.join(cwd, f)) for f in ("captions.json", "avatar_ranges.json", "plan.json", "shots_timed.json")): return False
+    try: tiene = {os.path.splitext(f)[0] for d in ("fotos", "clips") if os.path.isdir(os.path.join(cwd, d)) for f in os.listdir(os.path.join(cwd, d))}
+    except OSError: return False
+    sh = server.jload(os.path.join(cwd, "shots_timed.json"), []) or []
+    return len(tiene) >= 8 and bool(sh) and all(isinstance(s, dict) and s.get("id") in tiene for s in sh)
+
+
+def xm_fin(log_tail=True):
+    """Cierra la extrema de fondo (si sigue viva la corta: el video no la espera) y pasa sus líneas al log."""
+    p = xm["p"]
+    if p and p.poll() is None:
+        try: os.killpg(p.pid, 15)                  # también el render de Remotion que cuelga de ella
+        except OSError: p.terminate()
+        try: p.wait(30)
+        except subprocess.TimeoutExpired:
+            try: os.killpg(p.pid, 9)
+            except OSError: p.kill()
+        try: os.remove(os.path.join(xm["cwd"], "extrema", "EN_CURSO"))
+        except OSError: pass
+        log("extrema: no terminó a tiempo, el video sale sin ella")
+    if log_tail and os.path.exists(XM_LOG):
+        with open(XM_LOG, encoding="utf8", errors="replace") as f:
+            for _l in [l for l in f.read().splitlines() if "extrema:" in l][-14:]: log(tapar(_l)[:200])
+
+
+def xm_lanzar():
+    """Arranca extrema.py en segundo plano MIENTRAS se espera el avatar; render.py mete las piezas en el único armado final."""
+    try:
+        cwd = server.video(st["rid"])["cwd"]
+        if not xm_lista(cwd): return
+        xm["p"] = subprocess.Popen([sys.executable, BASE + "/tools/extrema.py", cwd, "--tope", XM_TOPE, "--fondo"],
+                                   stdout=open(XM_LOG, "a"), stderr=subprocess.STDOUT, start_new_session=True)
+        xm["t"] = time.time(); xm["cwd"] = cwd; st["xm_fondo"] = True; server.jsave(ST, st)
+        log("extrema: arranca en segundo plano mientras llega el avatar")
+    except Exception as e: log("extrema: no pude arrancarla (", type(e).__name__, ")")
+
+
 relanzar, ult = False, 0
 while True:
     time.sleep(20)
     meta = server.jload(os.path.join(server.rdir(st["rid"]), "meta.json"), {})
     vivo = server.alive(meta.get("pid"))
     if time.time() - ult > 60:
+        if XM_ON and xm["p"] is None and not st.get("extrema"): xm_lanzar()
+        elif xm["p"] and xm["p"].poll() is None and time.time() - xm["t"] > 95 * 60: xm_fin(False)     # colgada: no se espera más
         ult = time.time(); publicar("trabajando" if vivo else "pensando")
         nuevos = mensajes_nuevos()
         if nuevos:
@@ -320,7 +391,11 @@ if relanzar:
 
 # ── 3b) EDICIÓN EXTREMA (si el panel la pidió): corre acá, fuera de la sesión, con tope duro. Nunca rompe el video:
 #        se guarda el final de la sesión y, si algo sale mal, vuelve ése.
-if str(E.get("EXTREMA") or "").lower() in ("1", "true", "si", "sí") and not st.get("extrema"):
+#        Lo normal ya es que haya corrido de fondo mientras llegaba el avatar (un solo armado): acá sólo se cierra.
+#        El camino viejo (después del final, con segundo armado) queda de respaldo si nunca llegó a arrancar.
+if XM_ON and st.get("xm_fondo") and not st.get("extrema"):
+    xm_fin(); st["extrema"] = True; server.jsave(ST, st)
+if XM_ON and not st.get("extrema"):
     _v = server.video(st["rid"]); _cwd = _v["cwd"]
     _fin = os.path.join(_cwd, _v["files"]["final"]) if _v["files"].get("final") else None
     if not _fin or not os.path.exists(_fin): log("extrema: no hay final todavía, se saltea")
